@@ -1,0 +1,20 @@
+{
+  "name": "amallo",
+  "version": "1.0.0",
+  "description": "AI terminal agent powered by Ollama — local or remote VPS via SSH tunnel",
+  "type": "module",
+  "bin": {
+    "amallo": "./bin/amallo.js"
+  },
+  "scripts": {
+    "start": "node bin/amallo.js"
+  },
+  "dependencies": {
+    "ssh2": "^1.15.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["ollama", "ai", "terminal", "agent", "cli"],
+  "license": "MIT"
+}
