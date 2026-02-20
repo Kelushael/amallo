@@ -1,27 +1,39 @@
 /**
- * Core agent loop: prompts model, parses bash/write blocks,
- * runs them with user approval, feeds results back.
+ * Conversational agent loop — persistent back-and-forth like Claude Code.
  */
 import { createInterface } from 'readline';
 import { writeFileSync }   from 'fs';
-import { SYSTEM_PROMPT, MAX_RETRIES } from './config.js';
+import { SYSTEM_PROMPT }   from './config.js';
 import { createShell }     from './shell.js';
 
-const rl = createInterface({ input: process.stdin, output: process.stdout });
-const ask = (q) => new Promise((r) => rl.question(q, r));
+// ── colours ───────────────────────────────────────────────────────────────────
+const C = {
+  reset:  '\x1b[0m',
+  bold:   '\x1b[1m',
+  dim:    '\x1b[2m',
+  cyan:   '\x1b[36m',
+  yellow: '\x1b[33m',
+  green:  '\x1b[32m',
+  red:    '\x1b[31m',
+  purple: '\x1b[35m',
+};
 
+function print(color, label, text) {
+  process.stdout.write(`${color}${C.bold}${label}${C.reset} ${text}\n`);
+}
+
+// ── block parsing ─────────────────────────────────────────────────────────────
 function parseBlock(text) {
-  // bash block
   const bash = text.match(/```bash\n([\s\S]*?)\n```/);
   if (bash) return { kind: 'bash', payload: bash[1].trim() };
 
-  // write block
   const write = text.match(/```write:(.+?)\n([\s\S]*?)\n```/);
   if (write) return { kind: 'write', path: write[1].trim(), payload: write[2] };
 
   return null;
 }
 
+// ── file write ────────────────────────────────────────────────────────────────
 function writeFile(path, content) {
   try {
     writeFileSync(path, content);
@@ -31,79 +43,142 @@ function writeFile(path, content) {
   }
 }
 
-export async function runAgent({ ollama, model, userPrompt }) {
+// ── streaming-style print (char by char feel) ─────────────────────────────────
+async function printReply(text) {
+  process.stdout.write(`\n${C.purple}${C.bold}amallo${C.reset}  `);
+  // print in small chunks so it feels live
+  const words = text.split(' ');
+  for (const word of words) {
+    process.stdout.write(word + ' ');
+    await new Promise(r => setTimeout(r, 8));
+  }
+  process.stdout.write('\n');
+}
+
+// ── main loop ─────────────────────────────────────────────────────────────────
+export async function runAgent({ ollama, model, initialPrompt }) {
   const shell = createShell();
+
+  const rl = createInterface({
+    input:  process.stdin,
+    output: process.stdout,
+    terminal: true,
+  });
+
+  const ask = (prompt) => new Promise((resolve) => {
+    rl.question(prompt, resolve);
+  });
 
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user',   content: userPrompt },
   ];
 
-  let retries = 0;
+  if (initialPrompt) {
+    messages.push({ role: 'user', content: initialPrompt });
+  }
 
-  console.log(`\n[amallo] model=${model}  server=${ollama.baseUrl}\n`);
+  let autoRespond = !!initialPrompt; // if we have an initial prompt, go straight to model
+
+  console.log(`\n${C.dim}  model: ${model}   /models /exit${C.reset}\n`);
 
   try {
-    while (retries < MAX_RETRIES) {
-      const reply = await ollama.chat(model, messages);
-      console.log(`\n\x1b[36m[model]\x1b[0m\n${reply}\n`);
+    while (true) {
+      // ── get user input (unless we're auto-responding after a command) ────────
+      if (!autoRespond) {
+        const raw = await ask(`\n${C.cyan}${C.bold}you${C.reset}  `);
+        const input = raw.trim();
 
-      if (reply.includes('DONE')) {
-        console.log('[amallo] Task complete.');
-        break;
-      }
+        if (!input) continue;
+        if (input === '/exit' || input === 'exit') break;
 
-      const block = parseBlock(reply);
-      if (!block) {
-        console.log('[amallo] No actionable block. Stopping.');
-        break;
+        if (input === '/models') {
+          try {
+            const models = await ollama.listModels();
+            models.forEach((m, i) => console.log(`  ${i + 1}. ${m}`));
+            const choice = await ask('  pick number (enter to keep current): ');
+            const idx = parseInt(choice, 10) - 1;
+            if (models[idx]) {
+              model = models[idx];
+              print(C.green, '✓', `switched to ${model}`);
+            }
+          } catch (e) {
+            print(C.red, '!', e.message);
+          }
+          continue;
+        }
+
+        messages.push({ role: 'user', content: input });
       }
+      autoRespond = false;
+
+      // ── call model ───────────────────────────────────────────────────────────
+      process.stdout.write(`\n${C.dim}  thinking…${C.reset}`);
+      let reply;
+      try {
+        reply = await ollama.chat(model, messages);
+      } catch (e) {
+        process.stdout.write('\r' + ' '.repeat(20) + '\r');
+        print(C.red, 'error', e.message);
+        continue;
+      }
+      process.stdout.write('\r' + ' '.repeat(20) + '\r');
+
+      // ── display reply ────────────────────────────────────────────────────────
+      await printReply(reply);
 
       messages.push({ role: 'assistant', content: reply });
 
-      // ── bash block ──────────────────────────────────────────────────────
+      // ── check for action block ───────────────────────────────────────────────
+      const block = parseBlock(reply);
+      if (!block) continue;
+
+      // ── bash block ───────────────────────────────────────────────────────────
       if (block.kind === 'bash') {
-        console.log(`\x1b[33m[command]\x1b[0m\n${block.payload}\n`);
-        const ans = await ask('Execute? [y/N]: ');
-        if (ans.toLowerCase() !== 'y') { console.log('Skipped.'); break; }
-
-        const { output, isError } = await shell.exec(block.payload);
-        console.log(`\x1b[32m[output]\x1b[0m\n${output}\n`);
-
-        if (isError) {
-          retries++;
-          messages.push({ role: 'user', content: `Error:\n${output}\n\nFix it.` });
-        } else {
-          retries = 0;
-          messages.push({ role: 'user', content: `Terminal output:\n${output}` });
+        const ans = await ask(`\n${C.yellow}  run?${C.reset} [Y/n] `);
+        if (ans.toLowerCase() === 'n') {
+          messages.push({ role: 'user', content: 'I skipped that command. Please suggest an alternative or explain.' });
+          autoRespond = true;
+          continue;
         }
+
+        process.stdout.write(`${C.dim}  running…${C.reset}\n`);
+        const { output, isError } = await shell.exec(block.payload);
+
+        const label = isError ? `${C.red}  error${C.reset}` : `${C.green}  output${C.reset}`;
+        console.log(`${label}\n${C.dim}${output}${C.reset}`);
+
+        messages.push({
+          role: 'user',
+          content: isError
+            ? `Command failed with error:\n${output}\n\nPlease fix it.`
+            : `Command succeeded. Output:\n${output}`,
+        });
+        autoRespond = true; // model should react to the output automatically
       }
 
-      // ── write block ─────────────────────────────────────────────────────
+      // ── write block ──────────────────────────────────────────────────────────
       else if (block.kind === 'write') {
-        const preview = block.payload.split('\n').slice(0, 10).join('\n');
-        console.log(`\x1b[33m[write]\x1b[0m ${block.path}\n${preview}\n${block.payload.split('\n').length > 10 ? '...' : ''}`);
-        const ans = await ask(`Write file '${block.path}'? [y/N]: `);
-        if (ans.toLowerCase() !== 'y') { console.log('Skipped.'); break; }
+        const ans = await ask(`\n${C.yellow}  write ${block.path}?${C.reset} [Y/n] `);
+        if (ans.toLowerCase() === 'n') {
+          messages.push({ role: 'user', content: 'I skipped the file write. Please adjust.' });
+          autoRespond = true;
+          continue;
+        }
 
         const { out, isError } = writeFile(block.path, block.payload);
-        console.log(`[result] ${out}`);
+        const label = isError ? `${C.red}  error${C.reset}` : `${C.green}  ✓${C.reset}`;
+        console.log(`${label} ${out}`);
 
-        if (isError) {
-          retries++;
-          messages.push({ role: 'user', content: `File write failed: ${out}\n\nFix it.` });
-        } else {
-          retries = 0;
-          messages.push({ role: 'user', content: out });
-        }
+        messages.push({
+          role: 'user',
+          content: isError ? `File write failed: ${out}. Fix it.` : out,
+        });
+        autoRespond = true;
       }
-    }
-
-    if (retries >= MAX_RETRIES) {
-      console.log(`[amallo] Max retries (${MAX_RETRIES}) reached.`);
     }
   } finally {
     shell.close();
     rl.close();
+    console.log(`\n${C.dim}  session ended${C.reset}\n`);
   }
 }
